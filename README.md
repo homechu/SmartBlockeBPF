@@ -1,79 +1,101 @@
-# smart-block
+# SmartBlock
 
-An eBPF-based IP blocking tool with Proxy Protocol v1 v2 support.
+An eBPF-based IP blocking tool with **Proxy Protocol v1/v2** support, designed for high-performance security in modern Linux environments.
 
-## Prerequisites
+---
 
-To build and run `smart-block`, you need the following dependencies:
+## 🚀 Features
 
-### Linux
+- **High Performance**: Leverages eBPF/XDP for packet filtering at the lowest level of the network stack.
+- **Proxy Aware**: Supports Proxy Protocol v1 and v2 to identify real client IPs behind load balancers.
+- **Flexible Management**:
+  - **Global**: Block IPs across the entire interface.
+  - **Group-based**: Target specific server-client pairs using logical groups.
+- **Rule Persistence**: Optional `--keep` flag to maintain blocking rules even after the main process exits.
+- **Stats Tracking**: Real-time packet and byte count for blocked traffic.
 
-```bash
-sudo apt install -y build-essential pkg-config libssl-dev libgit2-dev
-```
+---
+
+## 🛠 Prerequisites
+
+### System Requirements
+
+- **OS**: Linux (tested on Ubuntu 18.04/20.04)
+- **Kernel**: >= 5.4 recommended (requires XDP support)
+- **Dependencies**:
+  ```bash
+  sudo apt install -y build-essential pkg-config libssl-dev libgit2-dev
+  ```
 
 ### Rust Toolchain
 
-- **Stable & Nightly**:
-  ```bash
-  rustup toolchain install stable
-  rustup toolchain install nightly --component rust-src
-  ```
-- **BPF Linker**:
-  ```bash
-  cargo install bpf-linker
-  ```
+```bash
+# Install Stable & Nightly (Nightly required for eBPF source)
+rustup toolchain install stable
+rustup toolchain install nightly --component rust-src
 
-## Build & Run
+# Install BPF Linker
+cargo install bpf-linker
+```
 
-### Debug Build
+---
+
+## 🏗 Build & Run
+
+### 1. Build
 
 ```bash
-# The build script automatically handles eBPF compilation
+# Standard Build
 cargo build
 
-# Run with debug logging
-sudo ./target/debug/smart-block --iface [INTERFACE] --debug
-```
-
-### Release Build (Static Linking)
-
-```bash
+# Release Build (Static linking for distribution)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
-
-# Resulting binary:
-# target/x86_64-unknown-linux-musl/release/smart-block
 ```
 
-## Usage
+### 2. Run
 
-### Options
+```bash
+# Basic run (Interface ens160)
+sudo ./target/debug/smart-block --iface ens160
 
-| Flag      | Description                                                                                         |
-| --------- | --------------------------------------------------------------------------------------------------- |
-| `--iface` | Network interface to attach the XDP program (default: `ens160`).                                    |
-| `--debug` | Enable debug logging in the eBPF program.                                                           |
-| `--keep`  | Do not remove pinned BPF maps from `/sys/fs/bpf/` upon exit. This allows blocking rules to persist. |
+# Run with persistence & debug logs
+sudo ./target/debug/smart-block --iface ens160 --keep --debug
+```
+
+### 💡 Options Reference
+
+| Flag      | Description                                            | Default  |
+| :-------- | :----------------------------------------------------- | :------- |
+| `--iface` | Network interface to attach the XDP program.           | `ens160` |
+| `--debug` | Enable eBPF kernel debug logs (`trace_pipe`).          | `false`  |
+| `--keep`  | Persist BPF maps (rules) at `/sys/fs/bpf/` after exit. | `false`  |
+
+---
+
+## 📖 Usage Guide
 
 ### Global IP Management
 
-Manage global blacklisted IPs.
+Manage the main blacklist applicable to the entire interface.
 
 ```bash
-sudo ./smart-block --iface ens192
-
+# Add an IP to blacklist
 sudo ./smart-block add [IP_ADDRESS]
+
+# Remove an IP
 sudo ./smart-block remove [IP_ADDRESS]
+
+# List all blocked IPs and stats
 sudo ./smart-block list
 ```
 
-### Group-based IP Management
+### Group-based Management
 
-Manage IP blocking based on specific server addresses and group names (useful for multi-tenant environments).
+Manage blocking for specific virtual groups (useful for multi-tenant setups).
 
 ```bash
-# Add a client IP to a specific group associated with a server
+# Add client to a group for a specific server IP
 sudo ./smart-block group add [GROUP_NAME] [SERVER_IP] [CLIENT_IP]
 
 # Remove from group
@@ -83,36 +105,34 @@ sudo ./smart-block group remove [GROUP_NAME] [SERVER_IP] [CLIENT_IP]
 sudo ./smart-block group list
 ```
 
-## Supported Systems
+---
 
-The following kernel versions have been tested and are confirmed to be compatible:
+## 🐧 Supported Systems
 
-- Ubuntu 18.04/20.04 (Kernel **5.4.0-58-generic**)
-- Any Linux distribution with XDP support (Kernel >= 5.4 recommended)
+- **Ubuntu 18.04/20.04**: Kernel `5.4.0-58-generic` (Tested)
+- **Generic Linux**: Any distribution with XDP support (Kernel >= 5.4)
 
-## Cross-compilation (macOS)
+---
 
-If you are developing on macOS, you can cross-compile to Linux using `musl`.
+## 🍎 Cross-compilation (macOS)
+
+Develop on macOS and compile for Linux using `musl`.
 
 ```bash
-# Prerequisites for macOS
-brew install llvm
-brew install filosottile/musl-cross/musl-cross
+# Tools
+brew install llvm filosottile/musl-cross/musl-cross
 
-# Build command
+# Build
 CC=${ARCH}-linux-musl-gcc cargo build --package smart-block --release \
   --target=${ARCH}-unknown-linux-musl \
   --config=target.${ARCH}-unknown-linux-musl.linker=\"${ARCH}-linux-musl-gcc\"
 ```
 
-_Note: Replace `${ARCH}` with `x86_64` or `aarch64` depending on your target._
+> _Note: Replace `${ARCH}` with `x86_64` or `aarch64`._
 
-## License
+---
 
-With the exception of eBPF code, `smart-block` is distributed under the terms of either the [MIT license] or the [Apache License] (version 2.0).
+## 📜 License
 
-All eBPF code is distributed under either the terms of the [GNU General Public License, Version 2] or the [MIT license].
-
-[Apache license]: LICENSE-APACHE
-[MIT license]: LICENSE-MIT
-[GNU General Public License, Version 2]: LICENSE-GPL2
+- **General**: Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+- **eBPF Code**: Dual-licensed under [GPL-2.0](LICENSE-GPL2) or [MIT](LICENSE-MIT).
