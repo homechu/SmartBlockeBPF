@@ -1,0 +1,9 @@
+[target."cfg(all())"]
+runner = "sudo -E"
+
+[target.bpfel-unknown-none]
+runner = "echo"
+rustflags = ["-C", "panic=abort"]
+
+[unstable]
+build-std = ["core"]

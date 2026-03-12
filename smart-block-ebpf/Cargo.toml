@@ -1,0 +1,23 @@
+[package]
+name = "smart-block-ebpf"
+version = "1.0.0"
+edition.workspace = true
+
+[dependencies]
+smart-block-common = { path = "../smart-block-common" }
+network-types = "0.0.5"
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "smart-block"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
