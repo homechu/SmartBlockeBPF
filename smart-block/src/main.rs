@@ -1,4 +1,4 @@
-use aya::maps::{Array, HashMap};
+use aya::maps::{Array, HashMap, LpmTrie};
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
 
@@ -8,6 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::collections::HashMap as StdHashMap;
+use std::str::FromStr;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -27,10 +28,12 @@ struct Opt {
 #[derive(Debug, Subcommand)]
 enum Command {
     Add {
-        ip: Ipv4Addr,
+        #[clap(help = "IP address or CIDR range (e.g. 1.2.3.4 or 1.2.3.0/24)")]
+        target: String,
     },
     Remove {
-        ip: Ipv4Addr,
+        #[clap(help = "IP address or CIDR range (e.g. 1.2.3.4 or 1.2.3.0/24)")]
+        target: String,
     },
     List,
     Group {
@@ -54,7 +57,6 @@ enum GroupCommand {
     List,
 }
 
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
@@ -68,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pin_path_stats = "/sys/fs/bpf/smartblock_stats";
-    let pin_path_global = "/sys/fs/bpf/smartblock_global";
+    let pin_path_cidr = "/sys/fs/bpf/smartblock_cidr";
     let pin_path_server_to_group = "/sys/fs/bpf/smartblock_server_to_group";
     let pin_path_group_blocks = "/sys/fs/bpf/smartblock_group_blocks";
     let pin_path_group_names = "/sys/fs/bpf/smartblock_group_names";
@@ -76,41 +78,57 @@ async fn main() -> anyhow::Result<()> {
     // Handle CLI commands
     if let Some(cmd) = opt.command {
         match cmd {
-            Command::Add { ip } => {
+            Command::Add { target } => {
+                let (ip, prefix) = parse_cidr(&target)?;
+                
                 let stats_data = aya::maps::MapData::from_pin(pin_path_stats)?;
                 let mut stats_map: HashMap<_, u32, BlockStats> = HashMap::try_from(aya::maps::Map::from_map_data(stats_data)?)?;
                 
-                let global_data = aya::maps::MapData::from_pin(pin_path_global)?;
-                let mut global_map: HashMap<_, u32, u32> = HashMap::try_from(aya::maps::Map::from_map_data(global_data)?)?;
+                let ip_u32 = u32::from(ip);
+                let mask = if prefix == 0 { 0 } else { !((1u32 << (32 - prefix)) - 1) };
+                let masked_ip_be = (ip_u32 & mask).to_be();
                 
-                let key = u32::from(ip).to_be();
-                if stats_map.get(&key, 0).is_err() {
-                    stats_map.insert(key, BlockStats { pkts: 0, bytes: 0, last_seen: 0 }, 0)?;
+                let cidr_data = aya::maps::MapData::from_pin(pin_path_cidr)?;
+                let mut cidr_map: LpmTrie<_, u32, u32> = LpmTrie::try_from(aya::maps::Map::from_map_data(cidr_data)?)?;
+                let key = aya::maps::lpm_trie::Key::new(prefix, masked_ip_be);
+                cidr_map.insert(&key, masked_ip_be, 0)?;
+                
+                if stats_map.get(&masked_ip_be, 0).is_err() {
+                    stats_map.insert(&masked_ip_be, BlockStats { pkts: 0, bytes: 0, last_seen: 0 }, 0)?;
                 }
-                global_map.insert(key, 1, 0)?;
-                println!("Added {} to global blacklist", ip);
+                
+                println!("Added {}/{} to blacklist (Masked Base: {})", ip, prefix, Ipv4Addr::from(ip_u32 & mask));
             }
-            Command::Remove { ip } => {
-                let global_data = aya::maps::MapData::from_pin(pin_path_global)?;
-                let mut global_map: HashMap<_, u32, u32> = HashMap::try_from(aya::maps::Map::from_map_data(global_data)?)?;
-                let key = u32::from(ip).to_be();
-                global_map.remove(&key)?;
-                println!("Removed {} from global blacklist", ip);
+            Command::Remove { target } => {
+                let (ip, prefix) = parse_cidr(&target)?;
+                let ip_u32 = u32::from(ip);
+                let mask = if prefix == 0 { 0 } else { !((1u32 << (32 - prefix)) - 1) };
+                let masked_ip_be = (ip_u32 & mask).to_be();
+
+                let cidr_data = aya::maps::MapData::from_pin(pin_path_cidr)?;
+                let mut cidr_map: LpmTrie<_, u32, u32> = LpmTrie::try_from(aya::maps::Map::from_map_data(cidr_data)?)?;
+                let key = aya::maps::lpm_trie::Key::new(prefix, masked_ip_be);
+                cidr_map.remove(&key)?;
+                println!("Removed {}/{} from blacklist", ip, prefix);
             }
             Command::List => {
                 let stats_data = aya::maps::MapData::from_pin(pin_path_stats)?;
                 let stats_map: HashMap<_, u32, BlockStats> = HashMap::try_from(aya::maps::Map::from_map_data(stats_data)?)?;
-                let global_data = aya::maps::MapData::from_pin(pin_path_global)?;
-                let global_map: HashMap<_, u32, u32> = HashMap::try_from(aya::maps::Map::from_map_data(global_data)?)?;
                 
-                println!("\n=== Global Blacklist ===");
-                println!("{:<16} {:<10} {:<12} {:<20}", "IP Address", "Packets", "Data Size", "Last Seen");
+                let cidr_data = aya::maps::MapData::from_pin(pin_path_cidr)?;
+                let cidr_map: LpmTrie<_, u32, u32> = LpmTrie::try_from(aya::maps::Map::from_map_data(cidr_data)?)?;
+
+                println!("\n=== Blacklist (CIDR / IP) ===");
+                println!("{:<20} {:<10} {:<12} {:<20}", "Target", "Packets", "Data Size", "Last Seen");
                 println!("{:-<65}", "");
-                for result in global_map.iter() {
-                    let (key, _) = result?;
-                    if let Ok(stats) = stats_map.get(&key, 0) {
-                        let ip = Ipv4Addr::from(u32::from_be(key));
-                        println!("{:<16} {:<10} {:<12} {:<20}", ip, stats.pkts, format_size(stats.bytes), "N/A");
+                
+                for result in cidr_map.iter() {
+                    let (key, base_ip_be) = result?;
+                    let ip = Ipv4Addr::from(u32::from_be(key.data()));
+                    if let Ok(stats) = stats_map.get(&base_ip_be, 0) {
+                        println!("{:<20} {:<10} {:<12} {:<20}", format!("{}/{}", ip, key.prefix_len()), stats.pkts, format_size(stats.bytes), "N/A");
+                    } else {
+                        println!("{:<20} {:<10} {:<12} {:<20}", format!("{}/{}", ip, key.prefix_len()), "0", "0 B", "N/A");
                     }
                 }
             }
@@ -209,6 +227,21 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    fn parse_cidr(target: &str) -> anyhow::Result<(Ipv4Addr, u32)> {
+        if let Ok(ip) = Ipv4Addr::from_str(target) {
+            Ok((ip, 32))
+        } else if let Some((ip_str, prefix_str)) = target.split_once('/') {
+            let ip = Ipv4Addr::from_str(ip_str)?;
+            let prefix = prefix_str.parse::<u32>()?;
+            if prefix > 32 {
+                anyhow::bail!("Invalid prefix length: {}", prefix);
+            }
+            Ok((ip, prefix))
+        } else {
+            anyhow::bail!("Invalid IP or CIDR range: {}", target)
+        }
+    }
+
     fn get_group_id(name: &str) -> u32 {
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
@@ -263,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pin_maps = [
         ("BLOCK_STATS", pin_path_stats),
-        ("GLOBAL_BLOCKS", pin_path_global),
+        ("CIDR_BLOCKS", pin_path_cidr),
         ("SERVER_TO_GROUP", pin_path_server_to_group),
         ("GROUP_BLOCKS", pin_path_group_blocks),
         ("GROUP_NAMES", pin_path_group_names),
@@ -291,8 +324,8 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
-        _ = sigint.recv() => println!("Stopping (SIGINT)..."),
-        _ = sigterm.recv() => println!("Stopping (SIGTERM)..."),
+        _ = sigint.recv() => println!("* Stopping (SIGINT)..."),
+        _ = sigterm.recv() => println!("* Stopping (SIGTERM)..."),
     }
 
     if !opt.keep {

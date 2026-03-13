@@ -5,9 +5,10 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_ktime_get_ns, bpf_printk},
     macros::{map, xdp},
-    maps::{Array, HashMap},
+    maps::{Array, HashMap, LpmTrie},
     programs::XdpContext,
 };
+use aya_ebpf::bindings::BPF_F_NO_PREALLOC;
 use core::mem;
 use network_types::{
     eth::{EthHdr},
@@ -29,7 +30,7 @@ pub struct PPv2Info {
 static BLOCK_STATS: HashMap<u32, BlockStats> = HashMap::with_max_entries(8192, 0);
 
 #[map]
-static GLOBAL_BLOCKS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+static CIDR_BLOCKS: LpmTrie<u32, u32> = LpmTrie::with_max_entries(1024, BPF_F_NO_PREALLOC);
 
 #[map]
 static DROP_STATS: Array<u64> = Array::with_max_entries(1, 0);
@@ -186,11 +187,12 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
         };
     }
 
-    if unsafe { GLOBAL_BLOCKS.get(&src_addr).is_some() } {
-        if let Some(stats) = BLOCK_STATS.get_ptr_mut(&src_addr) {
+    let lpm_key = aya_ebpf::maps::lpm_trie::Key { prefix_len: 32, data: src_addr };
+    if let Some(base_ip) = CIDR_BLOCKS.get(&lpm_key) {
+        if let Some(stats) = BLOCK_STATS.get_ptr_mut(base_ip) {
             update_stats(stats, pkt_len);
-            return drop_packet();
-        }
+        } 
+        return drop_packet();
     }
 
     if unsafe { (*ip_hdr).proto } == IpProto::Tcp {
@@ -229,11 +231,13 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
                         bpf_printk!(b"     %u.%u", p3, p4); 
                     };
                 }
-                if unsafe { GLOBAL_BLOCKS.get(&proxied_ip).is_some() } {
-                    if let Some(stats) = BLOCK_STATS.get_ptr_mut(&proxied_ip) {
+
+                let p_lpm_key = aya_ebpf::maps::lpm_trie::Key { prefix_len: 32, data: proxied_ip };
+                if let Some(base_ip) = CIDR_BLOCKS.get(&p_lpm_key) {
+                    if let Some(stats) = BLOCK_STATS.get_ptr_mut(base_ip) {
                         update_stats(stats, pkt_len);
-                        return drop_packet();
                     }
+                    return drop_packet();
                 }
 
                 if let Some(group_id) = unsafe { SERVER_TO_GROUP.get(&info.server_ip) } {
@@ -244,8 +248,8 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
                     if unsafe { GROUP_BLOCKS.get(&key).is_some() } {
                         if let Some(stats) = BLOCK_STATS.get_ptr_mut(&proxied_ip) {
                             update_stats(stats, pkt_len);
-                            return drop_packet();
                         }
+                        return drop_packet();
                     }
                 }
             } else if let Some(proxied_ip) = get_proxied_ip_v1(payload_start, end) {
@@ -260,11 +264,13 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
                         bpf_printk!(b"     %u.%u", p3, p4); 
                     };
                 }
-                if unsafe { GLOBAL_BLOCKS.get(&proxied_ip).is_some() } {
-                    if let Some(stats) = BLOCK_STATS.get_ptr_mut(&proxied_ip) {
+
+                let p_lpm_key = aya_ebpf::maps::lpm_trie::Key { prefix_len: 32, data: proxied_ip };
+                if let Some(base_ip) = CIDR_BLOCKS.get(&p_lpm_key) {
+                    if let Some(stats) = BLOCK_STATS.get_ptr_mut(base_ip) {
                         update_stats(stats, pkt_len);
-                        return drop_packet();
                     }
+                    return drop_packet();
                 }
             }
         }
