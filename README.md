@@ -7,12 +7,13 @@ An eBPF-based IP blocking tool with **Proxy Protocol v1/v2** support, designed f
 ## 🚀 Features
 
 - **High Performance**: Leverages eBPF/XDP for packet filtering at the lowest level of the network stack.
+- **TCP TARPIT Defense**: Supports zero-window TCP tarpitting to lock up malicious scanners and attackers with 0 host socket / conntrack overhead.
 - **Proxy Aware**: Supports Proxy Protocol v1 and v2 to identify real client IPs behind load balancers.
 - **Flexible Management**:
-  - **Global**: Block IPs across the entire interface.
+  - **Global**: Block or tarpit IPs across the entire interface.
   - **Group-based**: Target specific server-client pairs using logical groups.
 - **Rule Persistence**: Optional `--keep` flag to maintain blocking rules even after the main process exits.
-- **Stats Tracking**: Real-time packet and byte count for blocked traffic.
+- **Stats Tracking**: Real-time packet and byte count for blocked and tarpitted traffic.
 
 ---
 
@@ -80,13 +81,16 @@ sudo ./target/debug/smart-block --iface ens160 --keep --debug
 Manage the main blacklist applicable to the entire interface.
 
 ```bash
-# Add an IP to blacklist
+# Add an IP to blacklist (Default: DROP)
 sudo ./smart-block add [IP_ADDRESS]
+
+# Add an IP with TCP TARPIT defense (Freezes attacker with Zero-Window SYN-ACK)
+sudo ./smart-block add [IP_ADDRESS] --action tarpit
 
 # Remove an IP
 sudo ./smart-block remove [IP_ADDRESS]
 
-# List all blocked IPs and stats
+# List all blocked IPs, actions, and stats
 sudo ./smart-block list
 ```
 
@@ -95,8 +99,11 @@ sudo ./smart-block list
 Manage blocking for specific virtual groups (useful for multi-tenant setups).
 
 ```bash
-# Add client to a group for a specific server IP
+# Add client to a group for a specific server IP (Default: DROP)
 sudo ./smart-block group add [GROUP_NAME] [SERVER_IP] [CLIENT_IP]
+
+# Add client to a group with TARPIT action
+sudo ./smart-block group add [GROUP_NAME] [SERVER_IP] [CLIENT_IP] --action tarpit
 
 # Remove from group
 sudo ./smart-block group remove [GROUP_NAME] [SERVER_IP] [CLIENT_IP]

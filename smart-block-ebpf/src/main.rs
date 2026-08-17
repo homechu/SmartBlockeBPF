@@ -15,7 +15,7 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
 };
-use smart_block_common::{BlockStats, GroupKey};
+use smart_block_common::{BlockStats, GroupKey, ACTION_DROP, ACTION_TARPIT};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,6 +53,207 @@ pub fn smart_block(ctx: XdpContext) -> u32 {
         Ok(ret) => ret,
         Err(_) => xdp_action::XDP_ABORTED,
     }
+}
+
+#[inline(always)]
+fn compute_ip_csum(ip_hdr_ptr: *const u8) -> u16 {
+    let p = ip_hdr_ptr as *const u16;
+    let mut sum: u32 = 0;
+    sum += u32::from(u16::from_be(unsafe { *p.add(0) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(1) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(2) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(3) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(4) }));
+    // Skip p.add(5) which is the checksum field
+    sum += u32::from(u16::from_be(unsafe { *p.add(6) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(7) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(8) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(9) }));
+
+    while (sum >> 16) > 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    (!sum as u16).to_be()
+}
+
+#[inline(always)]
+fn compute_tcp_csum(src_ip: u32, dst_ip: u32, tcp_hdr_ptr: *const u8, tcp_len: u16) -> u16 {
+    let mut sum: u32 = 0;
+
+    let sip_be = u32::from_be(src_ip);
+    sum += (sip_be >> 16) & 0xFFFF;
+    sum += sip_be & 0xFFFF;
+
+    let dip_be = u32::from_be(dst_ip);
+    sum += (dip_be >> 16) & 0xFFFF;
+    sum += dip_be & 0xFFFF;
+
+    sum += 6; // IPPROTO_TCP
+    sum += u32::from(tcp_len);
+
+    let p = tcp_hdr_ptr as *const u16;
+    sum += u32::from(u16::from_be(unsafe { *p.add(0) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(1) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(2) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(3) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(4) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(5) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(6) }));
+    sum += u32::from(u16::from_be(unsafe { *p.add(7) }));
+    // Skip p.add(8) which is the TCP checksum field
+    sum += u32::from(u16::from_be(unsafe { *p.add(9) }));
+
+    while (sum >> 16) > 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    (!sum as u16).to_be()
+}
+
+#[inline(always)]
+fn tarpit_tcp_syn(
+    eth: *mut EthHdr,
+    ip: *mut Ipv4Hdr,
+    tcp: *mut TcpHdr,
+    tcp_hdr_start: usize,
+) -> Result<u32, u32> {
+    unsafe {
+        let tmp_mac = (*eth).src_addr;
+        (*eth).src_addr = (*eth).dst_addr;
+        (*eth).dst_addr = tmp_mac;
+
+        let old_src_ip = (*ip).src_addr;
+        let old_dst_ip = (*ip).dst_addr;
+        (*ip).src_addr = old_dst_ip;
+        (*ip).dst_addr = old_src_ip;
+        (*ip).ttl = 64;
+        (*ip).tot_len = (20 + 20 as u16).to_be();
+
+        let tmp_port = (*tcp).source;
+        (*tcp).source = (*tcp).dest;
+        (*tcp).dest = tmp_port;
+
+        let incoming_seq = u32::from_be((*tcp).seq);
+        (*tcp).ack_seq = incoming_seq.wrapping_add(1).to_be();
+        let stateless_seq = incoming_seq.wrapping_mul(0xdeadbeef).wrapping_add(0x1337);
+        (*tcp).seq = stateless_seq.to_be();
+
+        let doff_ptr = (tcp_hdr_start as *mut u8).add(12);
+        *doff_ptr = 0x50;
+
+        let flags_ptr = (tcp_hdr_start as *mut u8).add(13);
+        *flags_ptr = 0x12; // SYN | ACK
+
+        (*tcp).window = 0;
+        (*tcp).urg_ptr = 0;
+
+        (*ip).check = 0;
+        (*ip).check = compute_ip_csum(ip as *const u8);
+
+        (*tcp).check = 0;
+        (*tcp).check = compute_tcp_csum((*ip).src_addr, (*ip).dst_addr, tcp as *const u8, 20);
+
+        Ok(xdp_action::XDP_TX)
+    }
+}
+
+#[inline(always)]
+fn tarpit_tcp_data(
+    eth: *mut EthHdr,
+    ip: *mut Ipv4Hdr,
+    tcp: *mut TcpHdr,
+    tcp_hdr_start: usize,
+    payload_len: u32,
+) -> Result<u32, u32> {
+    unsafe {
+        let tmp_mac = (*eth).src_addr;
+        (*eth).src_addr = (*eth).dst_addr;
+        (*eth).dst_addr = tmp_mac;
+
+        let old_src_ip = (*ip).src_addr;
+        let old_dst_ip = (*ip).dst_addr;
+        (*ip).src_addr = old_dst_ip;
+        (*ip).dst_addr = old_src_ip;
+        (*ip).ttl = 64;
+        (*ip).tot_len = (20 + 20 as u16).to_be();
+
+        let tmp_port = (*tcp).source;
+        (*tcp).source = (*tcp).dest;
+        (*tcp).dest = tmp_port;
+
+        let incoming_seq = u32::from_be((*tcp).seq);
+        let incoming_ack = u32::from_be((*tcp).ack_seq);
+        (*tcp).ack_seq = incoming_seq.wrapping_add(payload_len).to_be();
+        (*tcp).seq = incoming_ack.to_be();
+
+        let doff_ptr = (tcp_hdr_start as *mut u8).add(12);
+        *doff_ptr = 0x50;
+
+        let flags_ptr = (tcp_hdr_start as *mut u8).add(13);
+        *flags_ptr = 0x10; // ACK
+
+        (*tcp).window = 0;
+        (*tcp).urg_ptr = 0;
+
+        (*ip).check = 0;
+        (*ip).check = compute_ip_csum(ip as *const u8);
+
+        (*tcp).check = 0;
+        (*tcp).check = compute_tcp_csum((*ip).src_addr, (*ip).dst_addr, tcp as *const u8, 20);
+
+        Ok(xdp_action::XDP_TX)
+    }
+}
+
+#[inline(always)]
+fn handle_tarpit(
+    end: usize,
+    eth_hdr_ptr: *mut EthHdr,
+    ip_hdr_start: usize,
+    ip_hdr: *mut Ipv4Hdr,
+) -> Result<u32, u32> {
+    if unsafe { (*ip_hdr).proto } != IpProto::Tcp {
+        return drop_packet();
+    }
+
+    let ip_v_ihl = unsafe { *(ip_hdr_start as *const u8) };
+    let ip_len = ((ip_v_ihl & 0x0F) as usize) * 4;
+    if ip_len < 20 || ip_len > 60 {
+        return drop_packet();
+    }
+
+    let tcp_hdr_start = ip_hdr_start + ip_len;
+    if tcp_hdr_start + mem::size_of::<TcpHdr>() > end {
+        return drop_packet();
+    }
+
+    let tcp_hdr = tcp_hdr_start as *mut TcpHdr;
+    let data_offset = unsafe { (*(tcp_hdr_start as *const u8).add(12) >> 4) as usize } * 4;
+    if data_offset < 20 || data_offset > 60 {
+        return drop_packet();
+    }
+
+    let flags = unsafe { *(tcp_hdr_start as *const u8).add(13) };
+    let payload_start = tcp_hdr_start + data_offset;
+    let payload_len = if end >= payload_start { end - payload_start } else { 0 };
+
+    let is_syn = (flags & 0x02) != 0;
+    let is_ack = (flags & 0x10) != 0;
+    let is_rst = (flags & 0x04) != 0;
+    let is_fin = (flags & 0x01) != 0;
+
+    if is_rst || is_fin {
+        return drop_packet();
+    }
+
+    if is_syn && !is_ack {
+        return tarpit_tcp_syn(eth_hdr_ptr, ip_hdr, tcp_hdr, tcp_hdr_start);
+    }
+
+    if is_ack && payload_len > 0 {
+        return tarpit_tcp_data(eth_hdr_ptr, ip_hdr, tcp_hdr, tcp_hdr_start, payload_len as u32);
+    }
+
+    drop_packet()
 }
 
 #[inline(always)]
@@ -151,7 +352,7 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
     let end = ctx.data_end();
     let pkt_len = (end - start) as u64;
 
-    let eth_hdr_ptr: *const EthHdr = start as *const EthHdr;
+    let eth_hdr_ptr: *mut EthHdr = start as *mut EthHdr;
     if (start + mem::size_of::<EthHdr>()) > end {
         return Ok(xdp_action::XDP_PASS);
     }
@@ -165,7 +366,7 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
     if ip_hdr_start + mem::size_of::<Ipv4Hdr>() > end {
         return Ok(xdp_action::XDP_PASS);
     }
-    let ip_hdr = ip_hdr_start as *const Ipv4Hdr;
+    let ip_hdr = ip_hdr_start as *mut Ipv4Hdr;
     let src_addr = unsafe { (*ip_hdr).src_addr };
 
     let debug_enabled = if let Some(val) = CONFIG.get(0) {
@@ -189,9 +390,16 @@ fn try_smart_block(ctx: XdpContext) -> Result<u32, u32> {
 
     let lpm_key = aya_ebpf::maps::lpm_trie::Key { prefix_len: 32, data: src_addr };
     if let Some(base_ip) = CIDR_BLOCKS.get(&lpm_key) {
-        if let Some(stats) = BLOCK_STATS.get_ptr_mut(base_ip) {
+        let action = if let Some(stats) = BLOCK_STATS.get_ptr_mut(base_ip) {
             update_stats(stats, pkt_len);
-        } 
+            unsafe { (*stats).action }
+        } else {
+            ACTION_DROP
+        };
+
+        if action == ACTION_TARPIT {
+            return handle_tarpit(end, eth_hdr_ptr, ip_hdr_start, ip_hdr);
+        }
         return drop_packet();
     }
 

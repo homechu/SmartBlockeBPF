@@ -2,13 +2,28 @@ use aya::maps::{Array, HashMap, LpmTrie};
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
 
-use smart_block_common::{BlockStats, GroupKey};
+use smart_block_common::{BlockStats, GroupKey, ACTION_DROP, ACTION_TARPIT};
 use std::net::Ipv4Addr;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::collections::HashMap as StdHashMap;
 use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ActionArg {
+    Drop,
+    Tarpit,
+}
+
+impl From<ActionArg> for u32 {
+    fn from(arg: ActionArg) -> Self {
+        match arg {
+            ActionArg::Drop => ACTION_DROP,
+            ActionArg::Tarpit => ACTION_TARPIT,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -30,6 +45,9 @@ enum Command {
     Add {
         #[clap(help = "IP address or CIDR range (e.g. 1.2.3.4 or 1.2.3.0/24)")]
         target: String,
+
+        #[clap(long, value_enum, default_value = "drop", help = "Action for matched packets: drop or tarpit")]
+        action: ActionArg,
     },
     Remove {
         #[clap(help = "IP address or CIDR range (e.g. 1.2.3.4 or 1.2.3.0/24)")]
@@ -48,6 +66,9 @@ enum GroupCommand {
         group_name: String,
         server_ip: Ipv4Addr,
         client_ip: Ipv4Addr,
+
+        #[clap(long, value_enum, default_value = "drop", help = "Action for matched packets: drop or tarpit")]
+        action: ActionArg,
     },
     Remove {
         group_name: String,
@@ -78,8 +99,9 @@ async fn main() -> anyhow::Result<()> {
     // Handle CLI commands
     if let Some(cmd) = opt.command {
         match cmd {
-            Command::Add { target } => {
+            Command::Add { target, action } => {
                 let (ip, prefix) = parse_cidr(&target)?;
+                let action_code: u32 = action.into();
                 
                 let stats_data = aya::maps::MapData::from_pin(pin_path_stats)?;
                 let mut stats_map: HashMap<_, u32, BlockStats> = HashMap::try_from(aya::maps::Map::from_map_data(stats_data)?)?;
@@ -93,11 +115,17 @@ async fn main() -> anyhow::Result<()> {
                 let key = aya::maps::lpm_trie::Key::new(prefix, masked_ip_be);
                 cidr_map.insert(&key, masked_ip_be, 0)?;
                 
-                if stats_map.get(&masked_ip_be, 0).is_err() {
-                    stats_map.insert(&masked_ip_be, BlockStats { pkts: 0, bytes: 0, last_seen: 0 }, 0)?;
-                }
+                let mut current_stats = stats_map.get(&masked_ip_be, 0).unwrap_or(BlockStats {
+                    pkts: 0,
+                    bytes: 0,
+                    last_seen: 0,
+                    action: action_code,
+                    _pad: 0,
+                });
+                current_stats.action = action_code;
+                stats_map.insert(&masked_ip_be, current_stats, 0)?;
                 
-                println!("Added {}/{} to blacklist (Masked Base: {})", ip, prefix, Ipv4Addr::from(ip_u32 & mask));
+                println!("Added {}/{} to blacklist (Action: {:?}, Masked Base: {})", ip, prefix, action, Ipv4Addr::from(ip_u32 & mask));
             }
             Command::Remove { target } => {
                 let (ip, prefix) = parse_cidr(&target)?;
@@ -119,23 +147,28 @@ async fn main() -> anyhow::Result<()> {
                 let cidr_map: LpmTrie<_, u32, u32> = LpmTrie::try_from(aya::maps::Map::from_map_data(cidr_data)?)?;
 
                 println!("\n=== Blacklist (CIDR / IP) ===");
-                println!("{:<20} {:<10} {:<12} {:<20}", "Target", "Packets", "Data Size", "Last Seen");
-                println!("{:-<65}", "");
+                println!("{:<20} {:<10} {:<10} {:<12} {:<20}", "Target", "Action", "Packets", "Data Size", "Last Seen");
+                println!("{:-<75}", "");
                 
                 for result in cidr_map.iter() {
                     let (key, base_ip_be) = result?;
                     let ip = Ipv4Addr::from(u32::from_be(key.data()));
                     if let Ok(stats) = stats_map.get(&base_ip_be, 0) {
-                        println!("{:<20} {:<10} {:<12} {:<20}", format!("{}/{}", ip, key.prefix_len()), stats.pkts, format_size(stats.bytes), "N/A");
+                        let action_str = match stats.action {
+                            ACTION_TARPIT => "TARPIT",
+                            _ => "DROP",
+                        };
+                        println!("{:<20} {:<10} {:<10} {:<12} {:<20}", format!("{}/{}", ip, key.prefix_len()), action_str, stats.pkts, format_size(stats.bytes), "N/A");
                     } else {
-                        println!("{:<20} {:<10} {:<12} {:<20}", format!("{}/{}", ip, key.prefix_len()), "0", "0 B", "N/A");
+                        println!("{:<20} {:<10} {:<10} {:<12} {:<20}", format!("{}/{}", ip, key.prefix_len()), "DROP", "0", "0 B", "N/A");
                     }
                 }
             }
             Command::Group { command } => {
                 match command {
-                    GroupCommand::Add { group_name, server_ip, client_ip } => {
+                    GroupCommand::Add { group_name, server_ip, client_ip, action } => {
                         let group_id = get_group_id(&group_name);
+                        let action_code: u32 = action.into();
                         
                         // Update SERVER_TO_GROUP
                         let s2g_data = aya::maps::MapData::from_pin(pin_path_server_to_group)?;
@@ -146,15 +179,21 @@ async fn main() -> anyhow::Result<()> {
                         let gb_data = aya::maps::MapData::from_pin(pin_path_group_blocks)?;
                         let mut gb: HashMap<_, GroupKey, u32> = HashMap::try_from(aya::maps::Map::from_map_data(gb_data)?)?;
                         let key = GroupKey { group_id, client_ip: u32::from(client_ip).to_be() };
-                        gb.insert(key, 1, 0)?;
+                        gb.insert(key, action_code, 0)?;
 
                         // Ensure IP is in STATS pool
                         let stats_data = aya::maps::MapData::from_pin(pin_path_stats)?;
                         let mut stats_map: HashMap<_, u32, BlockStats> = HashMap::try_from(aya::maps::Map::from_map_data(stats_data)?)?;
                         let client_key = u32::from(client_ip).to_be();
-                        if stats_map.get(&client_key, 0).is_err() {
-                            stats_map.insert(client_key, BlockStats { pkts: 0, bytes: 0, last_seen: 0 }, 0)?;
-                        }
+                        let mut current_stats = stats_map.get(&client_key, 0).unwrap_or(BlockStats {
+                            pkts: 0,
+                            bytes: 0,
+                            last_seen: 0,
+                            action: action_code,
+                            _pad: 0,
+                        });
+                        current_stats.action = action_code;
+                        stats_map.insert(client_key, current_stats, 0)?;
 
                         // Update GROUP_NAMES
                         let gn_data = aya::maps::MapData::from_pin(pin_path_group_names)?;
@@ -165,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
                         name_bytes[..len].copy_from_slice(&bytes[..len]);
                         gn_map.insert(group_id, name_bytes, 0)?;
 
-                        println!("Added {} to group '{}' (ID: {}) for server {}", client_ip, group_name, group_id, server_ip);
+                        println!("Added {} to group '{}' (ID: {}, Action: {:?}) for server {}", client_ip, group_name, group_id, action, server_ip);
                     }
                     GroupCommand::Remove { group_name, server_ip: _, client_ip } => {
                         let group_id = get_group_id(&group_name);
@@ -195,8 +234,8 @@ async fn main() -> anyhow::Result<()> {
                             group_servers.entry(gid).or_default().push(Ipv4Addr::from(u32::from_be(sip_be)));
                         }
                         println!("\n=== Group Blacklist ===");
-                        println!("{:<15} {:<15} {:<30} {:<10} {:<12}", "IP Address", "Group Name", "Server IPs",  "Packets", "Data Size");
-                        println!("{:-<90}", "");
+                        println!("{:<15} {:<15} {:<25} {:<10} {:<10} {:<12}", "IP Address", "Group Name", "Server IPs", "Action", "Packets", "Data Size");
+                        println!("{:-<95}", "");
                         
                         // Use Arc for shared IP objects to satisfy user memory optimization request
                         let mut ip_cache: StdHashMap<u32, Arc<Ipv4Addr>> = StdHashMap::new();
@@ -215,10 +254,15 @@ async fn main() -> anyhow::Result<()> {
                             }).unwrap_or_else(|| "N/A".to_string());
 
                             let stats = stats_map.get(&key.client_ip, 0).ok();
+                            let action_code = stats.map(|s| s.action).unwrap_or(ACTION_DROP);
+                            let action_str = match action_code {
+                                ACTION_TARPIT => "TARPIT",
+                                _ => "DROP",
+                            };
                             let pkts = stats.map(|s| s.pkts).unwrap_or(0);
                             let bytes = stats.map(|s| s.bytes).unwrap_or(0);
 
-                            println!("{:<15} {:<15} {:<30} {:<10} {:<12}", client_ip_arc, group_name, servers, pkts, format_size(bytes));
+                            println!("{:<15} {:<15} {:<25} {:<10} {:<10} {:<12}", client_ip_arc, group_name, servers, action_str, pkts, format_size(bytes));
                         }
                     }
                 }
